@@ -1,0 +1,186 @@
+/**
+ * Kits para atención de derrames · Méderi
+ * Archivo Code.gs — va en Extensiones > Apps Script de la hoja de cálculo.
+ * Los datos se guardan en las hojas "Productos" y "Kits" de esta misma hoja de cálculo.
+ */
+ 
+const HOJAS = {
+  productos: { nombre: 'Productos', columnas: ['id','kit','producto','vence','historial','orden','actualizado'] },
+  kits:      { nombre: 'Kits',      columnas: ['id','numero','nombre'] }
+};
+const SESION_HORAS = 6;
+ 
+/* ---------- Página web ---------- */
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('Kits de Derrame Mederi')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+ 
+/* ---------- Menú en la hoja de cálculo ---------- */
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('Kits de derrame')
+    .addItem('1. Cargar datos iniciales', 'cargarDatosIniciales')
+    .addItem('2. Crear o cambiar acceso (correo y contraseña)', 'crearAcceso')
+    .addToUi();
+}
+ 
+function hoja_(col) {
+  const def = HOJAS[col];
+  if (!def) throw new Error('Colección no válida');
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(def.nombre);
+  if (!sh) {
+    sh = ss.insertSheet(def.nombre);
+    sh.getRange(1, 1, 1, def.columnas.length).setValues([def.columnas]).setFontWeight('bold').setBackground('#ff671d').setFontColor('#ffffff');
+    sh.setFrozenRows(1);
+    sh.getRange('A:Z').setNumberFormat('@'); // todo como texto para que Sheets no cambie las fechas
+  }
+  return sh;
+}
+ 
+function leer_(col) {
+  const def = HOJAS[col], sh = hoja_(col);
+  const n = sh.getLastRow();
+  if (n < 2) return [];
+  const vals = sh.getRange(2, 1, n - 1, def.columnas.length).getValues();
+  return vals.filter(r => r[0] !== '').map(r => {
+    const o = {};
+    def.columnas.forEach((c, i) => {
+      let v = r[i];
+      if (v instanceof Date) v = Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+      if (c === 'historial') { try { v = v ? JSON.parse(v) : []; } catch (e) { v = []; } }
+      if (c === 'kit' || c === 'numero' || c === 'orden') v = Number(v) || 0;
+      o[c] = v;
+    });
+    return o;
+  });
+}
+ 
+function fila_(col, obj) {
+  return HOJAS[col].columnas.map(c => {
+    const v = obj[c];
+    if (c === 'historial') return JSON.stringify(v || []);
+    return v === undefined || v === null ? '' : String(v);
+  });
+}
+ 
+/* ---------- Lectura (abierta para todos) ---------- */
+function obtenerDatos() {
+  return { productos: leer_('productos'), kits: leer_('kits') };
+}
+ 
+/* ---------- Acceso ---------- */
+function hash_(email, pass, salt) {
+  let h = salt + '|' + String(email).trim().toLowerCase() + '|' + pass;
+  for (let i = 0; i < 2000; i++) {
+    h = Utilities.base64Encode(Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, h, Utilities.Charset.UTF_8));
+  }
+  return h;
+}
+ 
+function crearAcceso() {
+  const ui = SpreadsheetApp.getUi();
+  const r1 = ui.prompt('Acceso de edición', 'Correo con el que se ingresará:', ui.ButtonSet.OK_CANCEL);
+  if (r1.getSelectedButton() !== ui.Button.OK) return;
+  const r2 = ui.prompt('Acceso de edición', 'Contraseña (mínimo 8 caracteres):', ui.ButtonSet.OK_CANCEL);
+  if (r2.getSelectedButton() !== ui.Button.OK) return;
+  const email = r1.getResponseText().trim().toLowerCase(), pass = r2.getResponseText();
+  if (!email || pass.length < 8) { ui.alert('La contraseña debe tener al menos 8 caracteres.'); return; }
+  const salt = Utilities.getUuid();
+  PropertiesService.getScriptProperties().setProperties({ ACCESO_SALT: salt, ACCESO_HASH: hash_(email, pass, salt) });
+  ui.alert('Acceso guardado. Ya puedes ingresar en la página con ese correo y contraseña.');
+}
+ 
+function ingresar(email, pass) {
+  const props = PropertiesService.getScriptProperties();
+  const salt = props.getProperty('ACCESO_SALT'), hash = props.getProperty('ACCESO_HASH');
+  if (!salt || !hash) throw new Error('Aún no se ha creado el acceso. Usa el menú "Kits de derrame" en la hoja de cálculo.');
+  const cache = CacheService.getScriptCache();
+  const fallos = Number(cache.get('fallos') || 0);
+  if (fallos >= 5) throw new Error('Demasiados intentos. Espera un minuto.');
+  if (hash_(email, pass, salt) !== hash) {
+    cache.put('fallos', String(fallos + 1), 60);
+    throw new Error('Correo o contraseña incorrectos.');
+  }
+  const token = Utilities.getUuid();
+  cache.put('t_' + token, String(email).trim().toLowerCase(), SESION_HORAS * 3600);
+  return { token: token, email: String(email).trim().toLowerCase() };
+}
+ 
+function validar_(token) {
+  const email = token && CacheService.getScriptCache().get('t_' + token);
+  if (!email) throw new Error('SESION: tu sesión terminó. Ingresa de nuevo.');
+  return email;
+}
+ 
+function salir(token) { if (token) CacheService.getScriptCache().remove('t_' + token); return true; }
+ 
+/* ---------- Escritura (requiere sesión) ---------- */
+function buscarFila_(sh, id) {
+  const n = sh.getLastRow();
+  if (n < 2) return -1;
+  const ids = sh.getRange(2, 1, n - 1, 1).getValues();
+  for (let i = 0; i < ids.length; i++) if (String(ids[i][0]) === String(id)) return i + 2;
+  return -1;
+}
+ 
+function guardar(token, col, id, datos) {
+  validar_(token);
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try {
+    const sh = hoja_(col);
+    id = id || Utilities.getUuid().slice(0, 20);
+    const obj = Object.assign({}, datos, { id: id });
+    const row = buscarFila_(sh, id);
+    const valores = [fila_(col, obj)];
+    if (row > 0) sh.getRange(row, 1, 1, valores[0].length).setValues(valores);
+    else sh.appendRow(valores[0]);
+    return id;
+  } finally { lock.releaseLock(); }
+}
+ 
+function actualizar(token, col, id, cambios) {
+  validar_(token);
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try {
+    const sh = hoja_(col), row = buscarFila_(sh, id);
+    if (row < 0) throw new Error('No se encontró el registro.');
+    const actual = leer_(col).find(o => String(o.id) === String(id));
+    const obj = Object.assign({}, actual, cambios, { id: id });
+    const valores = [fila_(col, obj)];
+    sh.getRange(row, 1, 1, valores[0].length).setValues(valores);
+    return id;
+  } finally { lock.releaseLock(); }
+}
+ 
+function borrar(token, col, id) {
+  validar_(token);
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try {
+    const sh = hoja_(col), row = buscarFila_(sh, id);
+    if (row > 0) sh.deleteRow(row);
+    return true;
+  } finally { lock.releaseLock(); }
+}
+ 
+/* ---------- Datos iniciales (copiados de la página en Claude el 27 oct 2026) ---------- */
+const DATOS_INICIALES = {"productos": [{"id": "k1-antibacterial", "kit": 1, "producto": "ANTIBACTERIAL", "vence": "2027-02-17", "historial": [], "orden": 1}, {"id": "k1-granulado", "kit": 1, "producto": "GRANULADO DESINFECTANTE", "vence": "2027-12-01", "historial": [], "orden": 2}, {"id": "k1-nitrilo", "kit": 1, "producto": "GUANTES DE NITRILO", "vence": "2026-12-12", "historial": [], "orden": 3}, {"id": "k1-latex", "kit": 1, "producto": "GUANTES DE LATEX", "vence": "2026-12-12", "historial": [], "orden": 4}, {"id": "2mbym528hra2tyh8phwm", "kit": 1, "producto": "BATA DESECHABLE", "vence": "", "historial": [], "orden": 99}, {"id": "4c8plw6bk24l56xatp9r", "kit": 1, "producto": "BOLSA ROJA", "vence": "", "historial": [], "orden": 99}, {"id": "ckejhgxrw8set6l6fw8a", "kit": 1, "producto": "ESPATULA O RECOGEDOR MANUAL", "vence": "", "historial": [], "orden": 99}, {"id": "7zx0h2qfv2109asjdkf5", "kit": 1, "producto": "GAFAS TRASPARENTE", "vence": "", "historial": [], "orden": 99}, {"id": "46hxhohfo89ad49fhhl1", "kit": 1, "producto": "GORRO", "vence": "", "historial": [], "orden": 99}, {"id": "pj5f31l8bwn20ny5xhlf", "kit": 1, "producto": "GUARDIAN 0.5 L", "vence": "", "historial": [], "orden": 99}, {"id": "3s06om2fbs8iuaer6xay", "kit": 1, "producto": "TAPABOCAS N95", "vence": "", "historial": [], "orden": 99}, {"id": "tt4omeajjphfy2x7i4kr", "kit": 1, "producto": "TERMIGOMETRO", "vence": "", "historial": [], "orden": 99}, {"id": "a2tuybsvfmp5cdk1ec0m", "kit": 1, "producto": "TOALLA DE PAPEL", "vence": "", "historial": [], "orden": 99}, {"id": "k2-antibacterial", "kit": 2, "producto": "ANTIBACTERIAL", "vence": "2027-02-17", "historial": [], "orden": 1}, {"id": "k2-granulado", "kit": 2, "producto": "GRANULADO DESINFECTANTE", "vence": "2027-12-01", "historial": [], "orden": 2}, {"id": "k2-nitrilo", "kit": 2, "producto": "GUANTES DE NITRILO", "vence": "2026-12-12", "historial": [], "orden": 3}, {"id": "k2-latex", "kit": 2, "producto": "GUANTES DE LATEX", "vence": "2026-12-12", "historial": [], "orden": 4}, {"id": "lk16up082yoo1mgfuaxx", "kit": 2, "producto": "BATA DESECHABLE", "vence": "", "historial": [], "orden": 99}, {"id": "m5k25nli5f534wd57kdk", "kit": 2, "producto": "BOLSA ROJA", "vence": "", "historial": [], "orden": 99}, {"id": "hclqutc0u1ag5et5x3dl", "kit": 2, "producto": "ESPATULA O RECOGEDOR MANUAL", "vence": "", "historial": [], "orden": 99}, {"id": "87n6g6km0lhcmpiwk69d", "kit": 2, "producto": "GAFAS TRASPARENTE", "vence": "", "historial": [], "orden": 99}, {"id": "t6p4097l7zxus7uk2tbx", "kit": 2, "producto": "GORRO", "vence": "", "historial": [], "orden": 99}, {"id": "269aedx11i9t6vlsrj6n", "kit": 2, "producto": "GUARDIAN 0.5 L", "vence": "", "historial": [], "orden": 99}, {"id": "if7yacw7y3okbk55yv8d", "kit": 2, "producto": "TAPABOCAS N95", "vence": "", "historial": [], "orden": 99}, {"id": "0u95568g2ajafkpjml7b", "kit": 2, "producto": "TERMIGOMETRO", "vence": "", "historial": [], "orden": 99}, {"id": "xh0at6venv6h1xdh7u77", "kit": 2, "producto": "TOALLA DE PAPEL", "vence": "", "historial": [], "orden": 99}, {"id": "k3-antibacterial", "kit": 3, "producto": "ANTIBACTERIAL", "vence": "2027-02-17", "historial": [{"nota": "", "repuesto": "2026-10-20", "vence": "2027-02-17"}, {"nota": "", "repuesto": "2026-10-20", "vence": "2027-03-02"}], "orden": 1}, {"id": "k3-granulado", "kit": 3, "producto": "GRANULADO DESINFECTANTE", "vence": "2027-12-01", "historial": [], "orden": 2}, {"id": "k3-nitrilo", "kit": 3, "producto": "GUANTES DE NITRILO", "vence": "2026-12-12", "historial": [], "orden": 3}, {"id": "k3-latex", "kit": 3, "producto": "GUANTES DE LATEX", "vence": "2026-12-12", "historial": [], "orden": 4}, {"id": "skvf5pdwaxg9dkhy0zht", "kit": 3, "producto": "BATA DESECHABLE", "vence": "", "historial": [], "orden": 99}, {"id": "yuhij1x4qi7x0oiyfpwb", "kit": 3, "producto": "BOLSA ROJA", "vence": "", "historial": [], "orden": 99}, {"id": "kf8bb3mw7e1dgddtcfip", "kit": 3, "producto": "ESPATULA O RECOGEDOR MANUAL", "vence": "", "historial": [], "orden": 99}, {"id": "4a5wc42xrscx3u6w76wp", "kit": 3, "producto": "GAFAS TRASPARENTE", "vence": "", "historial": [], "orden": 99}, {"id": "zkzbrkq17807r0aiovio", "kit": 3, "producto": "GORRO", "vence": "", "historial": [], "orden": 99}, {"id": "52y7uieqgi53w4h4vymv", "kit": 3, "producto": "GUARDIAN 0.5 L", "vence": "", "historial": [], "orden": 99}, {"id": "zhgz042u0xt2t1mpg67h", "kit": 3, "producto": "TAPABOCAS N95", "vence": "", "historial": [], "orden": 99}, {"id": "sah2btgfrvahobn59obb", "kit": 3, "producto": "TERMIGOMETRO", "vence": "", "historial": [], "orden": 99}, {"id": "q5ad6ygak2wh4d9wtt2c", "kit": 3, "producto": "TOALLA DE PAPEL", "vence": "", "historial": [], "orden": 99}, {"id": "k4-antibacterial", "kit": 4, "producto": "ANTIBACTERIAL", "vence": "2027-02-17", "historial": [], "orden": 1}, {"id": "k4-granulado", "kit": 4, "producto": "GRANULADO DESINFECTANTE", "vence": "2027-12-01", "historial": [], "orden": 2}, {"id": "k4-nitrilo", "kit": 4, "producto": "GUANTES DE NITRILO", "vence": "2026-12-12", "historial": [], "orden": 3}, {"id": "k4-latex", "kit": 4, "producto": "GUANTES DE LATEX", "vence": "2026-12-12", "historial": [], "orden": 4}, {"id": "e0wk4yuo2ly1ogcjvouq", "kit": 4, "producto": "BATA DESECHABLE", "vence": "", "historial": [], "orden": 99}, {"id": "6k4qeo6ntswm8eulqwvz", "kit": 4, "producto": "BOLSA ROJA", "vence": "", "historial": [], "orden": 99}, {"id": "vtc0945tl0co1bner4ie", "kit": 4, "producto": "ESPATULA O RECOGEDOR MANUAL", "vence": "", "historial": [], "orden": 99}, {"id": "uf354v8qo3xlqto0eh6x", "kit": 4, "producto": "GAFAS TRASPARENTE", "vence": "", "historial": [], "orden": 99}, {"id": "3h31j8hibho5323bkcg3", "kit": 4, "producto": "GORRO", "vence": "", "historial": [], "orden": 99}, {"id": "wtfgjimbs1qmkpf57usm", "kit": 4, "producto": "GUARDIAN 0.5 L", "vence": "", "historial": [], "orden": 99}, {"id": "qpeyyrum3bf3pcm01lq3", "kit": 4, "producto": "TAPABOCAS N95", "vence": "", "historial": [], "orden": 99}, {"id": "apj9gu2ly6qi4sqjpk9q", "kit": 4, "producto": "TERMIGOMETRO", "vence": "", "historial": [], "orden": 99}, {"id": "3padl263r4vcwzvdhlqi", "kit": 4, "producto": "TOALLA DE PAPEL", "vence": "", "historial": [], "orden": 99}], "kits": [{"id": "k3", "numero": 3, "nombre": "Luis Medina"}, {"id": "k2", "numero": 2, "nombre": "Miltol Villaraga"}, {"id": "k1", "numero": 1, "nombre": "Jaime Oviedo"}, {"id": "k4", "numero": 4, "nombre": "Correspondencia"}]};
+ 
+function cargarDatosIniciales() {
+  const ui = SpreadsheetApp.getUi();
+  const hp = hoja_('productos'), hk = hoja_('kits');
+  if (hp.getLastRow() > 1 || hk.getLastRow() > 1) {
+    const r = ui.alert('Ya hay datos', 'Las hojas ya tienen datos. ¿Reemplazarlos por los datos iniciales?', ui.ButtonSet.YES_NO);
+    if (r !== ui.Button.YES) return;
+    if (hp.getLastRow() > 1) hp.deleteRows(2, hp.getLastRow() - 1);
+    if (hk.getLastRow() > 1) hk.deleteRows(2, hk.getLastRow() - 1);
+  }
+  const P = DATOS_INICIALES.productos.map(p => fila_('productos', p));
+  const K = DATOS_INICIALES.kits.map(k => fila_('kits', k));
+  if (P.length) hp.getRange(2, 1, P.length, P[0].length).setValues(P);
+  if (K.length) hk.getRange(2, 1, K.length, K[0].length).setValues(K);
+  ui.alert('Listo: ' + P.length + ' productos y ' + K.length + ' kits cargados.');
+}
+ 
